@@ -4,7 +4,7 @@ use Net::FTP;
 use strict;
 
 our @ISA = qw|Net::FTP|;
-our $VERSION = '1.5';
+our $VERSION = '1.6';
 
 ###################################################################
 # Constants for the different file types
@@ -15,6 +15,9 @@ our $link_type = 3;
 
 our %options;
 our %filesSeen;
+our %dirsSeen;
+our %linkMap;
+our $success;
 
 #------------------------------------------------------------------
 # - cd to directory, lcd to directory
@@ -33,14 +36,23 @@ sub rget{
   my($ftp) = shift;
 
   %options = (ParseSub => \&parse_files,
-	      @_
+	      SymLinkIgnore => 1,
+	      @_,
+	      InitialDir => $ftp->pwd
 	     );    #setup the options
 
+  %dirsSeen = ();
   %filesSeen = ();
+
+  if ( $options{SymlinkFollow} ) {
+    chomp( my $pwd = `pwd` );
+    $dirsSeen{ $ftp->pwd } = $pwd;
+  }
 
   $ftp->_rget(); #do the real work here
 
   %filesSeen = ();
+  %dirsSeen = ();
 
 }
 
@@ -52,8 +64,15 @@ sub _rget {
 
   my(@files) = $options{ParseSub}->($ftp->dir);
 
+  @files = grep { ref eq 'Net::FTP::Recursive::File' } @files;
+
+  @files = grep { $_->filename =~ $options{MatchAll} } @files if $options{MatchAll};
+
+  @files = grep { $_->filename !~ $options{OmitAll} } @files if $options{OmitAll};
+
   print STDERR join("\n",map { $_->originalLine() } @files),"\n" if $ftp->debug;
 
+ FILE:
   foreach my $file (@files){
     #used to make sure that if we're deleting the files, we
     #successfully retrieved the file
@@ -62,6 +81,12 @@ sub _rget {
     #if it's not a directory we just need to get the file.
     if ( $file->isPlainFile() ) {
       my $filename = $file->filename();
+
+      next FILE if $options{MatchFiles}
+	           and $filename !~ $options{MatchFiles};
+
+      next FILE if $options{OmitFiles}
+	           and $filename =~ $options{OmitFiles};
 
       if ( $options{FlattenTree} and $filesSeen{$filename} ) {
 	print STDERR "Retrieving $filename as $filename.$filesSeen{$filename}.\n" if $ftp->debug;
@@ -82,14 +107,53 @@ sub _rget {
 
     #if it's a directory, we have more work to do.
     elsif ( $file->isDirectory() ) {
-      push @dirs, $file;
-    }
+
+      my $filename = $file->filename();
+
+      next FILE if $options{MatchDirs}
+	           and $filename !~ $options{MatchDirs};
+
+      next FILE if $options{OmitDirs}
+	           and $filename =~ $options{OmitDirs};
+
+      if ( $options{SymlinkFollow} ) {
+
+	my $remote_pwd = $ftp->pwd;
+	my $local_pwd = `pwd`; chomp $local_pwd;
+
+	$dirsSeen{qq<$remote_pwd/$filename>} = qq<$local_pwd/$filename>;
+	print STDERR qq<Mapping '$remote_pwd/$filename' to '$local_pwd/$filename'.\n>;
+
+      }
+
+	push @dirs, $file;
+
+    } #end of elsif( $file->isDirectory() )
 
     elsif ( $file->isSymlink() ) {
 
+      #SymlinkIgnore is really the default.
       if ( $options{SymlinkIgnore} ) {
 	print STDERR "Ignoring the symlink ", $file->filename(), ".\n" if $ftp->debug;
-      } elsif ( $options{SymlinkLink}) {
+	if ( $options{RemoveRemoteFiles} ) {
+	  $ftp->delete( $file->filename );
+	  print STDERR 'Deleting \'', $file->filename,
+	    "'.\n" if $ftp->debug;
+	}
+	next FILE; #skip the stuff further in the if block
+
+      }
+
+
+      my $filename = $file->filename;
+
+      next FILE if $options{MatchLinks}
+	           and $filename !~ $options{MatchLinks};
+
+      next FILE if $options{OmitLinks}
+	           and $filename =~ $options{OmitLinks};
+
+      if ( $options{SymlinkLink}) {
 	#we need to make the symlink and that's it.
 	symlink $file->linkName(), $file->filename();
 	if ( $options{RemoveRemoteFiles} ) {
@@ -97,41 +161,117 @@ sub _rget {
 	  print STDERR 'Deleting \'', $file->filename,
 	    "'.\n" if $ftp->debug;
 	}
-      } else {
-	#otherwise we need to see if it points to a directory
-	if ( $ftp->cwd($file->filename()) ) {
-	  $ftp->cdup;
-	  push @dirs, $file if $options{SymlinkFollow};
-	} elsif ( $options{SymlinkCopy} ) { #if it's not and
-	                                    #SymlinkCopy is set,
-                                            #we'll copy the file
-	  my $filename = $file->filename();
+	next FILE; #skip the stuff further in the if block
 
-	  #symlink to non-directory.  need to grab it and
-	  #make sure the filename does not collide
-	  my $get_success;
-	  if ( $options{FlattenTree} and $filesSeen{$filename}) {
-	    print STDERR "Retrieving $filename as $filename.$filesSeen{$filename}.\n" if $ftp->debug;
-	    $get_success = $ftp->get( $filename, "$filename.$filesSeen{$filename}" );
-	  } else {
-	    print STDERR "Retrieving $filename.\n" if $ftp->debug;
-	    $get_success = $ftp->get( $filename );
+      }
+
+      #otherwise we need to see if it points to a directory
+      print STDERR "Testing to see if it refers to a directory.\n" if $ftp->debug;
+      my $path_before_chdir = $ftp->pwd;
+      my $is_directory = 0;
+
+      if ( $ftp->cwd($file->filename()) ) {
+	$ftp->cwd( $path_before_chdir );
+	$is_directory = 1;
+      }
+
+      if ( not $is_directory and $options{SymlinkCopy} ) { #if it's not and
+	                                                   #SymlinkCopy is set,
+                                                           #we'll copy the file
+	my $filename = $file->filename();
+
+	#symlink to non-directory.  need to grab it and
+	#make sure the filename does not collide
+	my $get_success;
+	if ( $options{FlattenTree} and $filesSeen{$filename}) {
+	  print STDERR "Retrieving $filename as $filename.$filesSeen{$filename}.\n" if $ftp->debug;
+	  $get_success = $ftp->get( $filename, "$filename.$filesSeen{$filename}" );
+	} else {
+	  print STDERR "Retrieving $filename.\n" if $ftp->debug;
+	  $get_success = $ftp->get( $filename );
+	}
+
+	$filesSeen{$filename}++;
+
+	if ( $get_success and $options{RemoveRemoteFiles} ) {
+	  $ftp->delete( $filename );
+	  print STDERR "Deleting '$filename'.\n" if $ftp->debug;
+	}
+      } #end of if (not $is_directory and $options{SymlinkCopy}
+
+      elsif ( $is_directory and $options{SymlinkFollow} ) {
+
+	my $filename = $file->filename();
+	my $remote_pwd = $ftp->pwd;
+	my $local_pwd = `pwd`; chomp $local_pwd;
+
+	#we need to resolve the link to an absolute path
+
+	my $remote_abs_path = path_resolve( $file->linkName,
+					    $remote_pwd,
+					    $filename );
+
+	print STDERR qq<'$filename' got converted to '$remote_abs_path'.\n>;
+
+	#if it's a directory structure we've already seen,
+	#we'll just make a relative symlink to that
+	#directory
+
+	# OR
+
+	#if it's in the same tree that we started
+	#downloading, we should get to it later, so we'll
+	#just make a relative symlink to that directory.
+
+	if ( $dirsSeen{$remote_abs_path}
+	     or $remote_abs_path =~ s%^$options{InitialDir}
+				     %$dirsSeen{$options{InitialDir}}%x ){
+
+	  unless( $options{FlattenTree} ){
+	    print STDERR qq<\$dirsSeen{$remote_abs_path} = $dirsSeen{$remote_abs_path}.\n>;
+	    print STDERR qq<Calling convert_to_relative( '$local_pwd/$filename', '>, ($dirsSeen{$remote_abs_path} || $remote_abs_path), qq<');\n>;
+	    my $rel_path = convert_to_relative( qq<$local_pwd/$filename>,
+						$dirsSeen{$remote_abs_path} || $remote_abs_path
+					      );
+	    print STDERR qq<Symlinking '$filename' to '$rel_path'.\n> if $ftp->debug;
+	    symlink $rel_path, $filename;
 	  }
 
-	  $filesSeen{$filename}++;
-
-	  if ( $get_success and $options{RemoveRemoteFiles} ) {
+	  if ( $options{RemoveRemoteFiles} ) {
 	    $ftp->delete( $filename );
 	    print STDERR "Deleting '$filename'.\n" if $ftp->debug;
 	  }
 
+	  next FILE;
 	}
 
-      }
+	# Otherwise we need to grab the directory and put
+	# the info in a hash in case there is another link
+	# to this directory
+	else {
+
+	  print STDERR "New directory to grab!\n";
+	  push @dirs, $file;
+
+	  my $filename = $file->filename();
+	  my $remote_pwd = $ftp->pwd;
+	  my $local_pwd = `pwd`; chomp $local_pwd;
+
+	  #$dirsSeen{qq<$remote_pwd/$filename>} = qq<$local_pwd/$filename>;
+	  print STDERR qq<3:Mapping '$remote_pwd/$filename' to '$local_pwd/$filename'.\n>;
+	  $dirsSeen{$remote_abs_path} = qq<$local_pwd/$filename>;
+	  print STDERR qq<4:Mapping '$remote_abs_path' to '$local_pwd/$filename'.\n>;
+	  #no deletion, will handle that down below.
+
+	}
+
+      } #end of if($is_directory and $options{SymlinkFollow})
 
     }
 
   }
+
+
 
   #this will do depth-first retrieval
   my $ftp_pwd = $ftp->pwd;
@@ -182,7 +322,7 @@ sub _rget {
 
     if ( $file->isSymlink() ) {
       $ftp->cwd( $ftp_pwd );
-      chdir
+      $options{RemoveRemoteFiles} = $remove;
     } else {
       $ftp->cdup;
     }
@@ -215,9 +355,13 @@ sub rput{
 
   %filesSeen = ();
 
+  local $success = 1;
+
   $ftp->_rput(); #do the real work here
 
   %filesSeen = ();
+
+  return $success;
 }
 
 #------------------------------------------------------------------
@@ -239,6 +383,8 @@ sub _rput {
 
   my @files = $options{ParseSub}->(@ls);
 
+  @files = grep { ref eq 'Net::FTP::Recursive::File' } @files;
+
   print STDERR join("\n", map { $_->originalLine() } @files),"\n" if $ftp->debug;
 
   foreach my $file (@files){
@@ -256,6 +402,7 @@ sub _rput {
       } else {
 	print STDERR "Sending $filename.\n" if $ftp->debug;
 	$put_success = $ftp->put( $filename );
+	$success = $put_success if $put_success == 0;
       }
 
       $filesSeen{$filename}++ if $options{FlattenTree};
@@ -321,19 +468,6 @@ sub _rput {
 
   foreach my $file (@dirs) {
 
-    unless ( $options{FlattenTree} ) {
-      print STDERR "Making dir: ", $file->filename(), "\n" if $ftp->debug;
-
-      unless ( $ftp->mkdir($file->filename()) ){
-	print STDERR 'Could not make remote directory ',
-	  $file->filename(), ", skipping!\n" if $ftp->debug;
-	next;
-      }
-
-      $ftp->cwd( $file->filename() );
-    }
-
-
     #unfortunately, perl doesn't seem to keep track of
     #symlinks very well, so we'll use an absolute path to
     #chdir at the end.
@@ -341,6 +475,22 @@ sub _rput {
     if ( $file->isSymlink() ) {
       $local_dir = `pwd`;
       chomp $local_dir;
+    }
+
+
+    unless ( $options{FlattenTree} ) {
+
+      print STDERR "Making dir: ", $file->filename(), "\n" if $ftp->debug;
+      unless( $ftp->mkdir($file->filename) ){
+	print STDERR 'Could not make remote directory ',
+	  $file->filename(), "!\n" if $ftp->debug;
+      }
+
+      unless ( $ftp->cwd($file->filename()) ){
+	print STDERR 'Could not change remote directory to ',
+	  $file->filename(), ", skipping!\n" if $ftp->debug;
+	next;
+      }
     }
 
     unless ( chdir $file->filename() ){
@@ -396,6 +546,8 @@ sub _rdir{
   my(@ls) = $ftp->dir;
 
   my(@files) = $options{ParseSub}->( @ls );
+
+  @files = grep { ref eq 'Net::FTP::Recursive::File' } @files;
 
   print STDERR join("\n",map { $_->originalLine() } @files),"\n" if $ftp->debug;
 
@@ -467,52 +619,53 @@ sub rdelete {
 
 sub _rdelete {
 
-   my $ftp = shift;
+  my $ftp = shift;
 
-   my @dirs;
+  my @dirs;
 
-   my(@files) = $options{ParseSub}->($ftp->dir);
+  my(@files) = $options{ParseSub}->($ftp->dir);
 
-   print STDERR join("\n",map { $_->originalLine() } @files),"\n" if 
-$ftp->debug;
+  @files = grep { ref eq 'Net::FTP::Recursive::File' } @files;
 
-   foreach my $file (@files){
+  print STDERR join("\n",map { $_->originalLine() } @files),"\n" if $ftp->debug;
 
-     #just delete plain files and symlinks
-     if ( $file->isPlainFile() or $file->isSymlink() ) {
-       my $filename = $file->filename();
-       $ftp->delete($filename);
-     }
+  foreach my $file (@files){
 
-     #otherwise, if it's a directory, we have more work to do.
-     elsif ( $file->isDirectory() ) {
-       push @dirs, $file;
-     }
-   }
+    #just delete plain files and symlinks
+    if ( $file->isPlainFile() or $file->isSymlink() ) {
+      my $filename = $file->filename();
+      $ftp->delete($filename);
+    }
 
-   #this will do depth-first delete
-   foreach my $file (@dirs) {
+    #otherwise, if it's a directory, we have more work to do.
+    elsif ( $file->isDirectory() ) {
+      push @dirs, $file;
+    }
+  }
 
-     #in case we didn't have permissions to cd into that
-     #directory
-     unless ( $ftp->cwd( $file->filename() ) ){
-       print STDERR 'Could not change dir to ',
-	 $file->filename(), "!\n" if $ftp->debug;
-       next;
-     }
+  #this will do depth-first delete
+  foreach my $file (@dirs) {
 
-     #need to recurse
-     print STDERR 'Calling _rdelete in ', $ftp->pwd, "\n" if $ftp->debug;
-     $ftp->_rdelete( );
+    #in case we didn't have permissions to cd into that
+    #directory
+    unless ( $ftp->cwd( $file->filename() ) ){
+      print STDERR 'Could not change dir to ',
+	$file->filename(), "!\n" if $ftp->debug;
+      next;
+    }
 
-     #once we've recursed, we'll go back up a dir.
-     print STDERR "Returned from _rdelete in " . $ftp->pwd . ".\n" if 
-$ftp->debug;
-     $ftp->cdup;
+    #need to recurse
+    print STDERR 'Calling _rdelete in ', $ftp->pwd, "\n" if $ftp->debug;
+    $ftp->_rdelete( );
 
-     ##now delete the directory we just came out of
-     $ftp->rmdir($file->filename());
-   }
+    #once we've recursed, we'll go back up a dir.
+    print STDERR "Returned from _rdelete in " . $ftp->pwd . ".\n" if
+      $ftp->debug;
+    $ftp->cdup;
+
+    ##now delete the directory we just came out of
+    $ftp->rmdir($file->filename());
+  }
 
 }
 
@@ -529,25 +682,27 @@ $ftp->debug;
 sub parse_files {
 
   #throw away the first line, it should be a "total" line
-  shift unless $options{KeepFirstLine};
+  #  shift unless $options{KeepFirstLine};
+  # this should be unnecessary with the change I made below.
 
-  my(@to_return);
+  my(@to_return) = ();
 
   foreach my $line (@_) {
 
     my($file); #reinitialize var
 
-    my @fields = $line =~ /^
-                            (\S+)\s+ #permissions %p
-                            (\d+)\s+ #link count %lc
-                            (\w+)\s+ #user owner %u
-                            (\w+)\s+ #group owner %g
-                            (\d+)\s+ #size %s
-                            (\w+\s+\w+\s+\S+)\s+ #last modification date %d
-                            (.+?)\s* #filename %f
-                            (?:->\s*(.+))? #optional link part %l
-                           $
-                          /x;
+    next unless my @fields =
+      $line =~ /^
+                 (\S+)\s+ #permissions %p
+                 (\d+)\s+ #link count %lc
+                 (\w+)\s+ #user owner %u
+                 (\w+)\s+ #group owner %g
+                 (\d+)\s+ #size %s
+                 (\w+\s+\w+\s+\S+)\s+ #last modification date %d
+                 (.+?)\s* #filename %f
+                 (?:->\s*(.+))? #optional link part %l
+                $
+               /x;
 
     my($perms) = ($1);
 
@@ -571,6 +726,8 @@ sub parse_files {
 					    IsPlainFile => 0,
 					    OriginalLine => $line,
 					    Fields => [@fields]);
+    } else {
+      next; #didn't match, skip the file
     }
 
     push(@to_return, $file);
@@ -580,6 +737,134 @@ sub parse_files {
   return(@to_return);
 
 }
+
+=begin blah
+
+  This subroutine takes a path and converts the '.' and
+  '..' parts of it to make it into a proper absolute path.
+
+=end blah
+
+=cut
+
+sub path_resolve{
+  my($link_path, $pwd, $filename) = @_;
+  my $remote_pwd; #value to return
+
+  #this case is so that if we have gotten to this
+  #symlink through another symlink, we can actually
+  #retrieve the correct files (make the correct
+  #symlink, whichever)
+
+  if ( $linkMap{$pwd} and $link_path !~ m#^/# ) {
+    $remote_pwd = $linkMap{$pwd} . '/' . $link_path;
+  }
+
+  # if it was an absolute path, just make sure there aren't
+  # any . or .. in it, and make sure it ends with a /
+  elsif ( $link_path =~ m#^/# ) {
+    $remote_pwd = $link_path;
+  }
+
+  #otherwise, it was a relative path and we need to
+  #prepend the current working directory onto it and
+  #then eliminate any .. or . that are present
+  else {
+    $remote_pwd = $pwd;
+    $remote_pwd =~ s#(?<!/)$#/#;
+    $remote_pwd .= $link_path;
+  }
+
+  #Collapse the resulting path if it has . or .. in it.  The
+  #while loop is needed to make it start over after each
+  #match (as it will need to go back for parts of the
+  #regex).  It's probably possible to write a regex to do it
+  #without the while loop, but I don't think that making it
+  #less readable is a good idea.  :)
+
+  while ( $remote_pwd =~ s#(?:^|/)\.(?:/|$)#/# ) {}
+  while ( $remote_pwd =~ s#(?:/[^/]+)?/\.\.(?:/|$)#/# ){}
+
+  #the %linkMap will store as keys the absolute paths
+  #to the links and the values will be the "real"
+  #absolute paths to those locations (to take care of
+  #../-type links
+
+  $filename =~ s#/$##;
+  $remote_pwd =~ s#/$##;
+
+  $pwd =~ s#(?<!/)$#/#; #make sure there's a / on the end
+  $linkMap{$pwd . $filename} = $remote_pwd;
+
+  $remote_pwd; #return the result
+
+}
+
+=begin blah
+
+  This subroutine takes two absolute paths and basically
+  'links' them together.  The idea is that all of the paths
+  that are created for the symlinks should be relative
+  paths.  This is the sub that does that.
+
+  There are essentially 6 cases:
+
+    -Different root hierarchy:
+        /tmp/testdata/blah -> /usr/local/bin/blah
+    -Current directory:
+        /tmp/testdata/blah -> /tmp/testdata
+    -A file in the current directory:
+        /tmp/testdata/blah -> /tmp/testdata/otherblah
+    -Lower in same hierarchy:
+        /tmp/testdata/blah -> /tmp/testdata/dir/otherblah
+    -A higher directory along the same path (part of link abs path) :
+        /tmp/testdata/dir/dir2/otherblah -> /tmp/testdata/dir
+    -In same hierarchy, somewhere else:
+        /tmp/testdata/dir/dir2/otherblah -> /tmp/testdata/dir/file
+
+  The last two cases are very similar, the only difference
+  will be that it will create '../' for the first rather
+  than the possible '../../dir'.  The last case will indeed
+  get the '../file'.
+
+=end blah
+
+=cut
+
+sub convert_to_relative{
+  my($link_loc, $realfile) = (shift, shift);
+  my $i;
+  my $result;
+  my($new_realfile, $new_link, @realfile_parts, @link_parts);
+
+  @realfile_parts = split m#/#, $realfile;
+  @link_parts = split m#/#, $link_loc;
+
+  for ( $i = 0; $i < @realfile_parts; $i++ ) {
+    last unless $realfile_parts[$i] eq $link_parts[$i];
+  }
+
+  $new_realfile = join '/', @realfile_parts[$i..$#realfile_parts];
+  $new_link = join '/', @link_parts[$i..$#link_parts];
+
+  if( $i == 1 ){
+    $result = $realfile;
+  } elsif ( $i > $#realfile_parts and $i == $#link_parts  ) {
+    $result = '.';
+  } elsif ( $i == $#realfile_parts and $i == $#link_parts ) {
+    $result = $realfile_parts[$i];
+  } elsif ( $i >= $#link_parts  ) {
+    $result = join '/', @realfile_parts[$i..$#realfile_parts];
+  } else {
+    $result = '../' x ($#link_parts - $i);
+    $result .= join '/', @realfile_parts[$i..$#realfile_parts]
+      if $#link_parts - $i > 0;
+  }
+
+  return $result;
+
+}
+
 
 package Net::FTP::Recursive::File;
 
@@ -687,7 +972,8 @@ more information.
 =over
 
 
-=item rget ( [ParseSub =>\&yoursub] [FlattenTree => 1] [RemoveRemoteFiles => 1])
+=item rget ( [ParseSub =>\&yoursub] [,FlattenTree => 1]
+             [,RemoveRemoteFiles => 1] )
 
 The recursive get method call.  This will recursively
 retrieve the ftp object's current working directory and its
@@ -699,20 +985,29 @@ server.  The default is to ignore the symlink, but you can
 control the behavior by passing one of these arguments to
 the rget call (ie, $ftp->rget(SymlinkIgnore => 1)):
 
-=over
+=over 12
 
-=item SymlinkIgnore - disregards symlinks
+=item SymlinkIgnore - disregards symlinks (default)
 
 =item SymlinkCopy - copies the link target from the server to the client (if accessible).  Works on files other than a directory.  For directories, see the C<SymlinkFollow> option.
 
 =item SymlinkLink - creates the link on the client.
 
-=item SymLinkFollow - will recurse into a symlink if it
-points to a directory.  This does not do cycle checking, use
-with EXTREME caution.  This option may be given along with
+=item SymlinkFollow - will recurse into a symlink if it
+points to a directory.  This option may be given along with
 one of the others above.
 
 =back
+
+The C<SymlinkFollow> option, as of v1.6, does more
+sophisticated handling of symlinks.  It will detect and
+avoid cycles, on all client platforms.  Also, if on a UNIX
+(tm) platform, if it detects a cycle, it will create a
+symlink to the location where it downloaded the directory
+(or will download it subsequently, if it is in the subtree
+under where the recursing started).  On Windows, it will
+call symlink just as on UNIX (tm), but that's probably not
+gonna do much for you.  :)
 
 The C<FlattenTree> optional argument will retrieve all of
 the files from the remote directory structure and place them
@@ -726,7 +1021,49 @@ will allow the client to delete files from the server after
 it retrieves them.  The default behavior is to leave all
 files and directories intact.
 
-=item rput ( [ParseSub => \&yoursub] [DirCommand => $cmd] [FlattenTree => 1] [RemoveLocalFiles => 1])
+For the v1.6 release, I have also added some additional
+functionality that will allow the client to be more specific
+in choosing those files that are retrieved.  All of these
+options take a regex object (made using the C<qr> operator)
+as their value.  You may choose to use one or more of these
+options, they are applied in the order that they are
+listed.  They are:
+
+=over
+
+=item MatchAll - Will process file that matches this regex,
+regardless of whether it is a plainish file, directory, or a
+symlink.  This behavior can be overridden with the previous
+options.
+
+=item OmitAll - Do not process file that matches this
+regex. Also may be overridden with the previous options.
+
+=item MatchFiles - Only transfer plainish (not a directory
+or a symlink) files that match this pattern.
+
+=item OmitFiles - Omit those plainish files that match this
+pattern.
+
+=item MatchDirs - Only recurse into directories that match
+this pattern.
+
+=item OmitDirs - Do not recurse into directories that match
+this pattern.
+
+=item MatchLinks - Only deal with those links that match
+this pattern (based on your symlink option, above).
+
+=item OmitLinks - Do not deal with links that match this
+pattern.
+
+=back
+
+Currently, the added functionality given to the rget method
+is not implemented for the rput method.
+
+=item rput ( [ParseSub => \&yoursub] [,DirCommand => $cmd]
+             [,FlattenTree => 1] [,RemoveLocalFiles => 1])
 
 The recursive put method call.  This will recursively send the local
 current working directory and its contents to the ftp object's current
@@ -772,7 +1109,8 @@ delete files that were actually transferred, symlinks
 (unless you set SymlinkCopy and it is a plain file) will not
 be removed (and of course any non-empty directories).
 
-=item rdir ( Filehandle => $fh [, FilenameOnly => 1 ] [, ParseSub => \&yoursub ] )
+=item rdir ( Filehandle => $fh [, FilenameOnly => 1]
+             [, ParseSub => \&yoursub ] )
 
 The recursive dir method call.  This will recursively retrieve
 directory contents from the server in a breadth-first fashion.
@@ -787,7 +1125,7 @@ information returned from the $ftp-dir call.
 
 This method does NOT follow symlinks, it will only print them out.  This will be changed for the next version of the module
 
-=item rls ( Filehandle => $fh [, ParseSub => \&yoursub ] )
+=item rls ( Filehandle => $fh [, ParseSub => \&yoursub] )
 
 The recursive ls method call.  This will recursively
 retrieve directory contents from the server in a
@@ -881,6 +1219,8 @@ these three fields should be set to a "true" value.
 
 =item Allow for formats to be given for output on rdir/rls.
 
+=item Allow for a regex of directories/files to omit
+
 =back
 
 =head1 REPORTING BUGS
@@ -910,6 +1250,7 @@ Raj Mudaliar - documentation fix.
 Brian Reischl - for rdelete code.
 Chris Smith - for RemoveRemoteFiles code.
 Zainul Charbiwala - bug report & code to fix.
+Brian McGraw - bug report & feature request.
 
 =head1 COPYRIGHT
 
